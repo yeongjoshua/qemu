@@ -4332,6 +4332,10 @@ foreach target : target_dirs
     t = target_arch[target_base_arch].apply(config_target, strict: false)
     arch_srcs += t.sources()
     arch_deps += t.dependencies()
+
+    if target_name == 'riscv64' or target_name == 'riscv32'
+        target_inc += include_directories('hw/misc/librpmi/include')
+    endif
   endif
 
   target_common = common_ss.apply(config_target, strict: false)

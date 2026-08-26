@@ -34,6 +34,7 @@
 #include "hw/riscv/iommu.h"
 #include "hw/riscv/riscv-iommu-bits.h"
 #include "hw/riscv/virt.h"
+#include "hw/misc/riscv_rpmi.h"
 #include "hw/riscv/boot.h"
 #include "hw/riscv/fdt-common.h"
 #include "hw/riscv/machines-qom.h"
@@ -82,6 +83,13 @@ static bool virt_aclint_allowed(void)
     return tcg_enabled() || qtest_enabled();
 }
 
+/*
+ * A2P request queue holds 16 slots; the P2A request direction is unused, so
+ * the transport is created with only the A2P-REQ and P2A-ACK queues.
+ */
+#define VIRT_RPMI_A2PREQ_QUEUE_SIZE (16 * RPMI_QUEUE_SLOT_SIZE)
+#define VIRT_RPMI_P2AREQ_QUEUE_SIZE 0
+
 static const MemMapEntry virt_memmap[] = {
     [VIRT_DEBUG] =        {        0x0,         0x100 },
     [VIRT_MROM] =         {     0x1000,        0xf000 },
@@ -98,6 +106,8 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_UART0] =        { 0x10000000,         0x100 },
     [VIRT_VIRTIO] =       { 0x10001000,        0x1000 },
     [VIRT_FW_CFG] =       { 0x10100000,          0x18 },
+    [VIRT_RPMI_SHMEM] =   { 0x10240000,        0xf000 },
+    [VIRT_RPMI_DOORBELL] = { 0x1024f000,       0x1000 },
     [VIRT_FLASH] =        { 0x20000000,     0x4000000 },
     [VIRT_IMSIC_M] =      { 0x24000000, VIRT_IMSIC_MAX_SIZE },
     [VIRT_IMSIC_S] =      { 0x28000000, VIRT_IMSIC_MAX_SIZE },
@@ -975,6 +985,104 @@ static void create_fdt_iommu(RISCVVirtState *s, uint16_t bdf)
     s->pci_iommu_bdf = bdf;
 }
 
+static void create_fdt_rpmi_mbox(RISCVVirtState *s,
+                                 uint64_t shmem_base, uint64_t db_base,
+                                 uint32_t *phandle, uint32_t *rpmi_mbox_handle,
+                                 uint32_t a2preq_qsz, uint32_t p2areq_qsz, uint32_t dbsz)
+{
+    char *name;
+
+    MachineState *mc = MACHINE(s);
+    uint64_t a2p_req_base, p2a_ack_base, p2a_req_base = 0, a2p_ack_base = 0;
+    static const char *const regnames_all[RPMI_ALL_NUM_REGS] = {
+        "a2p-req", "p2a-ack", "p2a-req", "a2p-ack", "a2p-doorbell"
+    };
+
+    static const char *const regnames_a2p[RPMI_A2P_NUM_REGS] = {
+        "a2p-req", "p2a-ack", "a2p-doorbell"
+    };
+
+    a2p_req_base = shmem_base;
+    p2a_ack_base = a2p_req_base + a2preq_qsz;
+    p2a_req_base = p2a_ack_base + a2preq_qsz;
+    a2p_ack_base = p2a_req_base + p2areq_qsz;
+
+    *rpmi_mbox_handle = (*phandle)++;
+    name = g_strdup_printf("/soc/mailbox@%" HWADDR_PRIx, shmem_base);
+    qemu_fdt_add_subnode(mc->fdt, name);
+    qemu_fdt_setprop_cell(mc->fdt, name, "riscv,slot-size",
+                          RPMI_QUEUE_SLOT_SIZE);
+    qemu_fdt_setprop_cell(mc->fdt, name, "#mbox-cells", 1);
+
+    if (p2areq_qsz) {
+        qemu_fdt_setprop_string_array(mc->fdt, name, "reg-names",
+                                  (char **)&regnames_all, ARRAY_SIZE(regnames_all));
+
+        qemu_fdt_setprop_cells(mc->fdt,
+            name, "reg",
+            (uint32_t)(a2p_req_base >> 32), (uint32_t)a2p_req_base,
+            0x0, a2preq_qsz,
+            (uint32_t)(p2a_ack_base >> 32), (uint32_t)p2a_ack_base,
+            0x0, a2preq_qsz,
+            (uint32_t)(p2a_req_base >> 32), (uint32_t)p2a_req_base,
+            0x0, p2areq_qsz,
+            (uint32_t)(a2p_ack_base >> 32), (uint32_t)a2p_ack_base,
+            0x0, p2areq_qsz,
+            (uint32_t)(db_base >> 32), (uint32_t)db_base,
+            0x0, dbsz);
+    }
+    else {
+        qemu_fdt_setprop_string_array(mc->fdt, name, "reg-names",
+                                  (char **)&regnames_a2p, ARRAY_SIZE(regnames_a2p));
+        qemu_fdt_setprop_cells(mc->fdt,
+            name, "reg",
+            (uint32_t)(a2p_req_base >> 32), (uint32_t)a2p_req_base,
+            0x0, a2preq_qsz,
+            (uint32_t)(p2a_ack_base >> 32), (uint32_t)p2a_ack_base,
+            0x0, a2preq_qsz,
+            (uint32_t)(db_base >> 32), (uint32_t)db_base,
+            0x0, dbsz);
+    }
+
+    qemu_fdt_setprop_cells(mc->fdt, name, "phandle", *rpmi_mbox_handle);
+    qemu_fdt_setprop_string(mc->fdt, name, "compatible",
+                            "riscv,rpmi-shmem-mbox");
+    g_free(name);
+}
+
+static void create_fdt_sbi_mbox(RISCVVirtState *s, uint32_t *phandle,
+                                uint32_t msi_phandle, uint32_t *mpxy_mbox_phandle)
+{
+    char *name;
+    MachineState *mc = MACHINE(s);
+    uint32_t mbox_phandle = (*phandle)++;
+
+    name = g_strdup_printf("/soc/sbi-mpxy-mbox");
+    qemu_fdt_add_subnode(mc->fdt, name);
+    qemu_fdt_setprop_string(mc->fdt, name, "compatible", "riscv,sbi-mpxy-mbox");
+    qemu_fdt_setprop_cell(mc->fdt, name, "#mbox-cells", 2);
+    if (s->aia_type == VIRT_AIA_TYPE_APLIC_IMSIC) {
+        qemu_fdt_setprop_cell(mc->fdt, name, "msi-parent", msi_phandle);
+    }
+    qemu_fdt_setprop_cell(mc->fdt, name, "phandle", mbox_phandle);
+    *mpxy_mbox_phandle = mbox_phandle;
+    g_free(name);
+}
+
+static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
+                                  uint64_t db_base, uint32_t msi_phandle,
+                                  uint32_t *phandle, uint32_t a2preq_qsz,
+                                  uint32_t p2areq_qsz, uint32_t dbsz)
+{
+    uint32_t rpmi_mbox_handle = 1, mpxy_mbox_phandle = 1;
+
+    create_fdt_rpmi_mbox(s, shmem_base, db_base, phandle, &rpmi_mbox_handle,
+                         a2preq_qsz, p2areq_qsz, dbsz);
+
+    /* Client nodes hanging off the SBI MPXY mailbox, consumed by the OS */
+    create_fdt_sbi_mbox(s, phandle, msi_phandle, &mpxy_mbox_phandle);
+}
+
 static void finalize_fdt(RISCVVirtState *s)
 {
     uint32_t phandle = 1, irq_mmio_phandle = 1, msi_pcie_phandle = 1;
@@ -995,6 +1103,17 @@ static void finalize_fdt(RISCVVirtState *s)
                     iommu_sys_phandle);
 
     create_fdt_reset(s, &phandle);
+
+    if (s->have_rpmi) {
+        const MemMapEntry *memmap = s->memmap;
+
+        create_fdt_rpmi_nodes(s, memmap[VIRT_RPMI_SHMEM].base,
+                              memmap[VIRT_RPMI_DOORBELL].base,
+                              msi_pcie_phandle, &phandle,
+                              VIRT_RPMI_A2PREQ_QUEUE_SIZE,
+                              VIRT_RPMI_P2AREQ_QUEUE_SIZE,
+                              memmap[VIRT_RPMI_DOORBELL].size);
+    }
 
     create_fdt_uart(s, irq_mmio_phandle);
 
@@ -1471,6 +1590,24 @@ static void virt_machine_init(MachineState *machine)
     /* SiFive Test MMIO device */
     sifive_test_create(s->memmap[VIRT_TEST].base);
 
+    if (s->have_rpmi) {
+        /*
+         * A single system-wide RPMI transport. It carries no per-hart
+         * service group, so harts_mask is empty.
+         *
+         * These are created here rather than from finalize_fdt() because
+         * finalize_fdt() is skipped when the user supplies -dtb, and the
+         * devices must exist whether the device tree is generated or
+         * imported.
+         */
+        riscv_rpmi_create(s->memmap[VIRT_RPMI_DOORBELL].base,
+                          s->memmap[VIRT_RPMI_SHMEM].base,
+                          s->memmap[VIRT_RPMI_SHMEM].size,
+                          VIRT_RPMI_A2PREQ_QUEUE_SIZE,
+                          VIRT_RPMI_P2AREQ_QUEUE_SIZE,
+                          0, true, machine);
+    }
+
     /* VirtIO MMIO devices */
     for (i = 0; i < VIRTIO_COUNT; i++) {
         sysbus_create_simple("virtio-mmio",
@@ -1616,6 +1753,20 @@ static void virt_set_aia(Object *obj, const char *val, Error **errp)
     }
 }
 
+static bool virt_get_rpmi(Object *obj, Error **errp)
+{
+    RISCVVirtState *s = RISCV_VIRT_MACHINE(obj);
+
+    return s->have_rpmi;
+}
+
+static void virt_set_rpmi(Object *obj, bool value, Error **errp)
+{
+    RISCVVirtState *s = RISCV_VIRT_MACHINE(obj);
+
+    s->have_rpmi = value;
+}
+
 static bool virt_get_aclint(Object *obj, Error **errp)
 {
     RISCVVirtState *s = RISCV_VIRT_MACHINE(obj);
@@ -1743,6 +1894,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
 #ifdef CONFIG_TPM
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
 #endif
+
+    object_class_property_add_bool(oc, "rpmi", virt_get_rpmi,
+                                   virt_set_rpmi);
+    object_class_property_set_description(oc, "rpmi",
+                                          "Set on/off to enable/disable "
+                                          "emulating RPMI devices");
 
     object_class_property_add_bool(oc, "aclint", virt_get_aclint,
                                    virt_set_aclint);
