@@ -2,6 +2,7 @@
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "librpmi.h"
+#include "hw/misc/riscv_rpmi.h"
 
 #define NUM_LEVELS_DISCRETE(a, d)       (sizeof(a) / sizeof(d))
 
@@ -364,6 +365,47 @@ const struct rpmi_voltage_platform_ops voltage_ops = {
     .set_level  = volt_set_level,
     .get_supp_levels = volt_get_supp_levels,
 };
+
+uint32_t riscv_rpmi_voltage_domain_count(void)
+{
+    return RPMI_VOLTAGE_DOMAIN_COUNT;
+}
+
+bool riscv_rpmi_voltage_domain_info(uint32_t id,
+                                    RISCVRPMIVoltageDomainInfo *info)
+{
+    const struct rpmi_voltage_data *vdata;
+    uint32_t i, lo, hi;
+
+    if (id >= RPMI_VOLTAGE_DOMAIN_COUNT || !info) {
+        return false;
+    }
+
+    vdata = &voltage_data[id];
+    info->name = vdata->name;
+    info->always_on = (vdata->control == RPMI_VOLT_CAPABILITY_ALWAYS_ON);
+
+    if (vdata->voltage_type == RPMI_VOLT_TYPE_LINEAR) {
+        info->min_uV = vdata->linear_range->uvolt_min;
+        info->max_uV = vdata->linear_range->uvolt_max;
+        return true;
+    }
+
+    lo = vdata->discrete_levels[0];
+    hi = vdata->discrete_levels[0];
+    for (i = 1; i < vdata->num_levels; i++) {
+        if ((uint32_t)vdata->discrete_levels[i] < lo) {
+            lo = vdata->discrete_levels[i];
+        }
+        if ((uint32_t)vdata->discrete_levels[i] > hi) {
+            hi = vdata->discrete_levels[i];
+        }
+    }
+    info->min_uV = lo;
+    info->max_uV = hi;
+
+    return true;
+}
 
 int add_voltage_group(struct rpmi_context *vctx)
 {

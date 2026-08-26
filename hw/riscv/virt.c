@@ -1186,15 +1186,80 @@ static void create_fdt_sbi_mpxy_performance(RISCVVirtState *s, uint32_t *phandle
     }
 }
 
-static void create_fdt_sbi_mpxy_voltage(RISCVVirtState *s, uint32_t mpxy_mbox_phandle)
+static void create_fdt_sbi_mpxy_voltage(RISCVVirtState *s,
+                                        uint32_t mpxy_mbox_phandle,
+                                        uint32_t *phandle)
 {
-    char *name;
+    char *name, *regulators, *child, *test;
     MachineState *mc = MACHINE(s);
+    uint32_t count, i;
+    uint32_t *supplies;
 
     name = g_strdup_printf("/soc/rpmi-voltage");
     qemu_fdt_add_subnode(mc->fdt, name);
     qemu_fdt_setprop_string(mc->fdt, name, "compatible", "riscv,rpmi-voltage");
     qemu_fdt_setprop_cells(mc->fdt, name, "mboxes", mpxy_mbox_phandle, 0x1004, 0x0);
+
+    /*
+     * The domains themselves are discovered from the platform microcontroller,
+     * but their constraints are a device tree concern and a supervisor needs
+     * them before it will let a consumer change a voltage. Describe them in
+     * the optional "regulators" container, and give each child a phandle so
+     * that it can be referenced as a supply.
+     */
+    count = riscv_rpmi_voltage_domain_count();
+    supplies = g_new0(uint32_t, count);
+
+    regulators = g_strdup_printf("%s/regulators", name);
+    qemu_fdt_add_subnode(mc->fdt, regulators);
+
+    for (i = 0; i < count; i++) {
+        RISCVRPMIVoltageDomainInfo info;
+
+        if (!riscv_rpmi_voltage_domain_info(i, &info)) {
+            continue;
+        }
+
+        supplies[i] = (*phandle)++;
+
+        child = g_strdup_printf("%s/%s", regulators, info.name);
+        qemu_fdt_add_subnode(mc->fdt, child);
+        qemu_fdt_setprop_string(mc->fdt, child, "regulator-name", info.name);
+        qemu_fdt_setprop_cell(mc->fdt, child, "regulator-min-microvolt",
+                              info.min_uV);
+        qemu_fdt_setprop_cell(mc->fdt, child, "regulator-max-microvolt",
+                              info.max_uV);
+        if (info.always_on) {
+            qemu_fdt_setprop(mc->fdt, child, "regulator-always-on", NULL, 0);
+        }
+        qemu_fdt_setprop_cell(mc->fdt, child, "phandle", supplies[i]);
+        g_free(child);
+    }
+
+    /*
+     * A consumer node so that a guest driver can exercise both the discrete
+     * and the linear level format through its own regulator API.
+     */
+    test = g_strdup_printf("/soc/rpmi-voltage-test");
+    qemu_fdt_add_subnode(mc->fdt, test);
+    qemu_fdt_setprop_string(mc->fdt, test, "compatible",
+                            "riscv,rpmi-voltage-test");
+    for (i = 0; i < count; i++) {
+        RISCVRPMIVoltageDomainInfo info;
+        char *prop;
+
+        if (!supplies[i] || !riscv_rpmi_voltage_domain_info(i, &info)) {
+            continue;
+        }
+
+        prop = g_strdup_printf("%s-supply", info.name);
+        qemu_fdt_setprop_cell(mc->fdt, test, prop, supplies[i]);
+        g_free(prop);
+    }
+    g_free(test);
+
+    g_free(regulators);
+    g_free(supplies);
     g_free(name);
 }
 
@@ -1220,7 +1285,7 @@ static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
     create_fdt_sbi_mpxy_device_power(s, phandle, mpxy_mbox_phandle,
                                      dpwr_phandle);
     create_fdt_sbi_mpxy_performance(s, phandle, mpxy_mbox_phandle, perf_phandle);
-    create_fdt_sbi_mpxy_voltage(s, mpxy_mbox_phandle);
+    create_fdt_sbi_mpxy_voltage(s, mpxy_mbox_phandle, phandle);
 }
 
 /*

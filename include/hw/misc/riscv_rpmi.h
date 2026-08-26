@@ -89,6 +89,22 @@ void handle_rpmi_event(void);
 DeviceState *rpmi_perf_init(hwaddr base_shmem, hwaddr base_db, void *data);
 
 /**
+ * Describes one emulated RPMI voltage domain to the device tree builder.
+ *
+ * @min_uV and @max_uV are the lowest and the highest level the domain can be
+ * set to, taken from the discrete level table or from the linear range that
+ * the domain advertises.
+ */
+struct riscv_rpmi_voltage_domain_info {
+    const char *name;
+    uint32_t min_uV;
+    uint32_t max_uV;
+    bool always_on;
+};
+
+typedef struct riscv_rpmi_voltage_domain_info RISCVRPMIVoltageDomainInfo;
+
+/**
  * Describes one emulated RPMI performance domain to the device tree builder.
  *
  * @level_count is how many levels the domain advertises, and @min_khz and
@@ -107,5 +123,9 @@ typedef struct riscv_rpmi_perf_domain_info RISCVRPMIPerfDomainInfo;
 
 uint32_t riscv_rpmi_perf_domain_count(void);
 bool riscv_rpmi_perf_domain_info(uint32_t id, RISCVRPMIPerfDomainInfo *info);
+
+uint32_t riscv_rpmi_voltage_domain_count(void);
+bool riscv_rpmi_voltage_domain_info(uint32_t id,
+                                    RISCVRPMIVoltageDomainInfo *info);
 
 #endif
