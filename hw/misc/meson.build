@@ -38,11 +38,13 @@ system_ss.add(when: 'CONFIG_SIFIVE_U_OTP', if_true: files('sifive_u_otp.c'))
 system_ss.add(when: 'CONFIG_SIFIVE_U_PRCI', if_true: files('sifive_u_prci.c'))
 specific_ss.add(when: 'CONFIG_RISCV_RPMI', if_true: files(
   'riscv_rpmi.c',
+  'riscv_rpmi_device_power.c',
   'riscv_rpmi_env.c',
   'librpmi/lib/rpmi_context.c',
   'librpmi/lib/rpmi_hsm.c',
   'librpmi/lib/rpmi_service_group_clock.c',
   'librpmi/lib/rpmi_service_group_cppc.c',
+  'librpmi/lib/rpmi_service_group_device_power.c',
   'librpmi/lib/rpmi_service_group_hsm.c',
   'librpmi/lib/rpmi_service_group_sysmsi.c',
   'librpmi/lib/rpmi_service_group_sysreset.c',

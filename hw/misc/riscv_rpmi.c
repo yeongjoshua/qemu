@@ -40,6 +40,7 @@ struct rpmi_context *rpmi_contexts[MAX_RPMI_XPORTS];
 int init_rpmi_svc_groups(hwaddr shm_addr, int shm_sz,
                          uint32_t a2preq_qsz, uint32_t p2areq_qsz,
                          uint32_t soc_xport_type);
+int add_device_power_group(struct rpmi_context *rctx);
 struct rpmi_shmem *rpmi_shmem_qemu_create(const char *name, rpmi_uint64_t base,
                                             rpmi_uint32_t size);
 
@@ -209,6 +210,11 @@ int init_rpmi_svc_groups(hwaddr shm_addr, int shm_sz,
                       "%s: rpmi_context_create failed\n ", __func__);
         return -1;
     }
+    if (soc_xport_type) {
+        /* create rpmi device power service group */
+        add_device_power_group(rctx);
+    }
+
     /* save the context */
     rpmi_contexts[g_contexts] = rctx;
     g_contexts++;
