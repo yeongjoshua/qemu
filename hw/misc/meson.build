@@ -41,6 +41,7 @@ specific_ss.add(when: 'CONFIG_RISCV_RPMI', if_true: files(
   'riscv_rpmi_device_power.c',
   'riscv_rpmi_env.c',
   'riscv_rpmi_performance.c',
+  'riscv_rpmi_voltage.c',
   'librpmi/lib/rpmi_context.c',
   'librpmi/lib/rpmi_hsm.c',
   'librpmi/lib/rpmi_service_group_clock.c',
@@ -51,6 +52,7 @@ specific_ss.add(when: 'CONFIG_RISCV_RPMI', if_true: files(
   'librpmi/lib/rpmi_service_group_sysmsi.c',
   'librpmi/lib/rpmi_service_group_sysreset.c',
   'librpmi/lib/rpmi_service_group_syssusp.c',
+  'librpmi/lib/rpmi_service_group_voltage.c',
   'librpmi/lib/rpmi_shmem.c',
   'librpmi/lib/rpmi_transport.c',
   'librpmi/lib/rpmi_transport_shmem.c'))
