@@ -28,12 +28,20 @@
 #include "qom/object.h"
 
 #define TYPE_RISCV_RPMI             "riscv.riscv.rpmi"
+#define TYPE_RISCV_RPMI_PERF        "riscv.riscv.rpmi.perf"
+#define TYPE_RISCV_RPMI_PERF_SHMEM  "riscv.riscv.rpmi.perf.shmem"
 
 #define RISCV_RISCV_RPMI(obj) \
     OBJECT_CHECK(RiscvRpmiState, (obj), TYPE_RISCV_RPMI)
 typedef struct RiscvRpmiState RiscvRpmiState;
 DECLARE_INSTANCE_CHECKER(RiscvRpmiState, RISCV_RPMI,
                          TYPE_RISCV_RPMI)
+
+#define RISCV_RISCV_RPMI_PERF(obj) \
+    OBJECT_CHECK(RiscvRpmiPerfState, (obj), TYPE_RISCV_RPMI_PERF)
+typedef struct RiscvRpmiPerfState RiscvRpmiPerfState;
+DECLARE_INSTANCE_CHECKER(RiscvRpmiPerfState, RISCV_RPMI_PERF,
+                         TYPE_RISCV_RPMI_PERF)
 
 #define __UNUSED__     __attribute__ ((unused))
 
@@ -47,6 +55,13 @@ DECLARE_INSTANCE_CHECKER(RiscvRpmiState, RISCV_RPMI,
 #define RPMI_ALL_NUM_REGS (RPMI_ALL_NUM_QUEUES + 1)
 #define RPMI_A2P_NUM_REGS (RPMI_A2P_NUM_QUEUES + 1)
 
+
+struct RiscvRpmiPerfState {
+    SysBusDevice parent_obj;
+    MemoryRegion mmio;
+    MemoryRegion ram;
+    uint8_t *ram_ptr;
+};
 
 struct RiscvRpmiState {
     /*< private >*/
@@ -70,5 +85,27 @@ DeviceState *riscv_rpmi_create(hwaddr db_addr, hwaddr shm_addr, int shm_sz,
                                MachineState *ms);
 
 void handle_rpmi_event(void);
+
+DeviceState *rpmi_perf_init(hwaddr base_shmem, hwaddr base_db, void *data);
+
+/**
+ * Describes one emulated RPMI performance domain to the device tree builder.
+ *
+ * @level_count is how many levels the domain advertises, and @min_khz and
+ * @max_khz are the lowest and the highest clock frequency among them.
+ * @set_level says whether a supervisor is allowed to change the level.
+ */
+struct riscv_rpmi_perf_domain_info {
+    const char *name;
+    uint32_t level_count;
+    uint32_t min_khz;
+    uint32_t max_khz;
+    bool set_level;
+};
+
+typedef struct riscv_rpmi_perf_domain_info RISCVRPMIPerfDomainInfo;
+
+uint32_t riscv_rpmi_perf_domain_count(void);
+bool riscv_rpmi_perf_domain_info(uint32_t id, RISCVRPMIPerfDomainInfo *info);
 
 #endif
