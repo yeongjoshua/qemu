@@ -1126,11 +1126,14 @@ static void create_fdt_sbi_mbox(RISCVVirtState *s, uint32_t *phandle,
 }
 
 static void create_fdt_sbi_mpxy_device_power(RISCVVirtState *s, uint32_t *phandle,
-                                             uint32_t mpxy_mbox_phandle)
+                                             uint32_t mpxy_mbox_phandle,
+                                             uint32_t *dpwr_phandle_out)
 {
     char *name;
     MachineState *mc = MACHINE(s);
     uint32_t dpwr_phandle = (*phandle)++;
+
+    *dpwr_phandle_out = dpwr_phandle;
 
     name = g_strdup_printf("/soc/rpmi-device-power");
     qemu_fdt_add_subnode(mc->fdt, name);
@@ -1199,7 +1202,8 @@ static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
                                   uint64_t db_base, uint32_t msi_phandle,
                                   uint32_t *phandle, uint32_t a2preq_qsz,
                                   uint32_t p2areq_qsz, uint32_t dbsz,
-                                  uint32_t *perf_phandle)
+                                  uint32_t *perf_phandle,
+                                  uint32_t *dpwr_phandle)
 {
     uint32_t rpmi_mbox_handle = 1, mpxy_mbox_phandle = 1;
 
@@ -1213,7 +1217,8 @@ static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
 
     /* Client nodes hanging off the SBI MPXY mailbox, consumed by the OS */
     create_fdt_sbi_mbox(s, phandle, msi_phandle, &mpxy_mbox_phandle);
-    create_fdt_sbi_mpxy_device_power(s, phandle, mpxy_mbox_phandle);
+    create_fdt_sbi_mpxy_device_power(s, phandle, mpxy_mbox_phandle,
+                                     dpwr_phandle);
     create_fdt_sbi_mpxy_performance(s, phandle, mpxy_mbox_phandle, perf_phandle);
     create_fdt_sbi_mpxy_voltage(s, mpxy_mbox_phandle);
 }
@@ -1251,11 +1256,34 @@ static void virt_fdt_add_performance_domains(RISCVVirtState *s,
     }
 }
 
+/*
+ * Attach the RTC to an RPMI device power domain.
+ *
+ * This is device tree wiring so that a guest exercises the power domain
+ * path against an emulated provider. QEMU does not gate the RTC on the
+ * domain state, so the device keeps working whatever the domain reports.
+ *
+ * It is applied after create_fdt_rtc() because the node does not exist
+ * while the RPMI nodes are being built, and it is kept out of
+ * create_fdt_rtc() so that no RPMI specific property leaks into a
+ * generic device.
+ */
+static void virt_fdt_add_rtc_power_domain(RISCVVirtState *s,
+                                          uint32_t dpwr_phandle)
+{
+    MachineState *ms = MACHINE(s);
+    g_autofree char *name = g_strdup_printf("/soc/rtc@%" HWADDR_PRIx,
+                                            s->memmap[VIRT_RTC].base);
+
+    qemu_fdt_setprop_cells(ms->fdt, name, "power-domains", dpwr_phandle, 0);
+}
+
 static void finalize_fdt(RISCVVirtState *s)
 {
     uint32_t phandle = 1, irq_mmio_phandle = 1, msi_pcie_phandle = 1;
     uint32_t irq_pcie_phandle = 1, irq_virtio_phandle = 1;
     uint32_t iommu_sys_phandle = 1;
+    uint32_t dpwr_phandle = 0;
 
     create_fdt_sockets(s, &phandle, &irq_mmio_phandle,
                        &irq_pcie_phandle, &irq_virtio_phandle,
@@ -1282,7 +1310,7 @@ static void finalize_fdt(RISCVVirtState *s)
                               VIRT_RPMI_A2PREQ_QUEUE_SIZE,
                               VIRT_RPMI_P2AREQ_QUEUE_SIZE,
                               memmap[VIRT_RPMI_DOORBELL].size,
-                              &perf_phandle);
+                              &perf_phandle, &dpwr_phandle);
 
         virt_fdt_add_performance_domains(s, perf_phandle);
     }
@@ -1290,6 +1318,10 @@ static void finalize_fdt(RISCVVirtState *s)
     create_fdt_uart(s, irq_mmio_phandle);
 
     create_fdt_rtc(s, irq_mmio_phandle);
+
+    if (s->have_rpmi) {
+        virt_fdt_add_rtc_power_domain(s, dpwr_phandle);
+    }
 }
 
 static void create_fdt(RISCVVirtState *s)
