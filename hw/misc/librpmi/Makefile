@@ -1,0 +1,375 @@
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Copyright (c) 2024 Ventana Micro Systems Inc.
+#
+
+# Select Make Options:
+MAKEFLAGS += -r --no-print-directory
+
+# Readlink -f requires GNU readlink
+ifeq ($(shell uname -s),Darwin)
+READLINK ?= greadlink
+else
+READLINK ?= readlink
+endif
+
+# Find out source, build, and install directories
+src_dir=$(CURDIR)
+ifdef O
+ build_dir=$(shell $(READLINK) -f $(O))
+else
+ build_dir=$(CURDIR)/build
+endif
+ifeq ($(build_dir),$(CURDIR))
+$(error Build directory is same as source directory.)
+endif
+install_root_dir_default=$(CURDIR)/install
+ifdef I
+ install_root_dir=$(shell $(READLINK) -f $(I))
+else
+ install_root_dir=$(install_root_dir_default)
+endif
+ifeq ($(install_root_dir),$(CURDIR))
+$(error Install root directory is same as source directory.)
+endif
+ifeq ($(install_root_dir),$(build_dir))
+$(error Install root directory is same as build directory.)
+endif
+docs_dir=$(build_dir)/docs
+install_docs_dir=$(install_root_dir)/docs
+LIBRPMI_HEADER := $(src_dir)/include/librpmi.h
+LIBRPMI_IMPL_VERSION_MAJOR := $(strip $(shell grep 'define LIBRPMI_IMPL_VERSION_MAJOR' $(LIBRPMI_HEADER) | awk '{print $$NF}'))
+LIBRPMI_IMPL_VERSION_MINOR := $(strip $(shell grep 'define LIBRPMI_IMPL_VERSION_MINOR' $(LIBRPMI_HEADER) | awk '{print $$NF}'))
+ifeq ($(LIBRPMI_IMPL_VERSION_MAJOR),)
+$(error Failed to parse LIBRPMI_IMPL_VERSION_MAJOR from $(LIBRPMI_HEADER))
+endif
+ifeq ($(LIBRPMI_IMPL_VERSION_MINOR),)
+$(error Failed to parse LIBRPMI_IMPL_VERSION_MINOR from $(LIBRPMI_HEADER))
+endif
+LIBRPMI_PATCH_VERSION ?= 0
+LIBRPMI_VERSION ?= $(LIBRPMI_IMPL_VERSION_MAJOR).$(LIBRPMI_IMPL_VERSION_MINOR).$(LIBRPMI_PATCH_VERSION)
+LIBRPMI_SOVERSION ?= 0
+LIBRPMI_LIBDIR ?= lib
+LIBRPMI_PKGCONFIG_LIBDIR ?= /$(LIBRPMI_LIBDIR)
+install_lib_dir=$(install_root_dir)/$(LIBRPMI_LIBDIR)
+pkgconfig_dir=$(install_lib_dir)/pkgconfig
+rpm_topdir=$(build_dir)/rpmbuild
+rpm_sourcedir=$(build_dir)/rpm
+rpm_spec=$(src_dir)/packaging/rpm/librpmi.spec
+rpm_source_tarball=$(rpm_sourcedir)/librpmi-$(LIBRPMI_VERSION).tar.gz
+deb_pkg_dir=$(src_dir)/packaging/debian
+deb_output_dir=$(build_dir)/deb
+deb_staging_dir=$(deb_output_dir)/librpmi-$(LIBRPMI_VERSION)
+deb_exclude_build=$(patsubst $(src_dir)/%,./%,$(build_dir))
+deb_exclude_install=$(patsubst $(src_dir)/%,./%,$(install_root_dir))
+RPMBUILD_NODEPS ?= 1
+RPMBUILD_MODE ?= -ba
+DEB_BUILD_ARGS ?= -us -uc -b
+# Check if verbosity is ON for build process
+CMD_PREFIX_DEFAULT := @
+ifeq ($(V), 1)
+	CMD_PREFIX :=
+else
+	CMD_PREFIX := $(CMD_PREFIX_DEFAULT)
+endif
+
+# Setup path of directories
+export include_dir=$(src_dir)/include
+export lib_dir=$(src_dir)/lib
+export test_dir=$(src_dir)/test
+
+ifeq ($(LLVM),1)
+CC		=	clang
+AR		=	llvm-ar
+AS		=	llvm-as
+LD		=	ld.lld
+OBJCOPY		=	llvm-objcopy
+else
+# Setup compilation commands
+ifdef CROSS_COMPILE
+CC		=	$(CROSS_COMPILE)gcc
+AR		=	$(CROSS_COMPILE)ar
+AS		=	$(CROSS_COMPILE)as
+LD		=	$(CROSS_COMPILE)ld
+else
+CC		?=	gcc
+AR		?=	ar
+AS		?=	as
+LD		?=	ld
+endif
+endif
+CPP		=	$(CC) -E
+
+# Setup list of objects.mk files
+lib-object-mks=$(shell if [ -d $(lib_dir)/ ]; then find $(lib_dir) -iname "objects.mk" | sort -r; fi)
+test-object-mks=$(shell if [ -d $(test_dir)/ ]; then find $(test_dir) -iname "objects.mk" | sort -r; fi)
+
+# Include all object.mk files
+include $(lib-object-mks)
+include $(test-object-mks)
+
+# Setup list of objects
+lib-objs-path-y=$(foreach obj,$(lib-objs-y),$(build_dir)/lib/$(obj))
+test-elfs-path-y=$(foreach elf,$(test-elfs-y),$(build_dir)/test/$(elf).elf)
+test-objs-path-y=$(foreach elf,$(test-elfs-y),$(build_dir)/test/$(elf).o)
+test-objs-path-y+=$(foreach elf,$(test-elfs-y),$(foreach obj,$($(elf)-objs-y),$(build_dir)/$(obj)))
+
+# Setup list of deps files for objects
+deps-y=$(lib-objs-path-y:.o=.dep)
+
+ifeq ($(LIBRPMI_TEST),y)
+deps-y+=$(test-objs-path-y:.o=.dep)
+endif
+
+# Setup compilation commands flags
+GENFLAGS	=	-Wall -Werror -g
+GENFLAGS	+=	-I$(include_dir) -I$(lib_dir)
+
+ifeq ($(LIBRPMI_DEBUG),y)
+GENFLAGS 	+=	 -O0 -DLIBRPMI_DEBUG
+else
+GENFLAGS 	+=	 -O2
+endif
+
+EXTRA_CFLAGS	+= 	-Wsign-compare
+
+CFLAGS		=	$(GENFLAGS)
+CFLAGS		+=	$(EXTRA_CFLAGS)
+CFLAGS		+=	-fPIC
+
+CPPFLAGS	+=	$(GENFLAGS)
+
+ARFLAGS		=	rcs
+
+ifeq ($(shell uname -s),Darwin)
+EXTRA_LDFLAGS	+=	-Wl,-install_name,librpmi.so.$(LIBRPMI_SOVERSION)
+EXTRA_LDFLAGS	+=	-Wl,-undefined,dynamic_lookup
+else
+EXTRA_LDFLAGS	+=	-Wl,-soname,librpmi.so.$(LIBRPMI_SOVERSION)
+endif
+
+ELFFLAGS	+=	$(build_dir)/librpmi.a
+ELFFLAGS	+=	$(EXTRA_ELFFLAGS)
+
+# Setup functions for compilation
+define dynamic_flags
+-I$(shell dirname $(2)) -D__OBJNAME__=$(subst -,_,$(shell basename $(1) .o))
+endef
+copy_file =  $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " COPY      $(subst $(build_dir)/,,$(1))"; \
+	     cp -f $(2) $(1)
+inst_file =  $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " INSTALL   $(subst $(install_root_dir)/,,$(1))"; \
+	     cp -f $(2) $(1)
+inst_file_list = $(CMD_PREFIX)if [ ! -z "$(4)" ]; then \
+	     mkdir -p $(1)"/"$(3); \
+	     for rel_file in $(4) ; do \
+	     dest_file=$(1)"/"$(3)"/"`echo $$rel_file`; \
+	     dest_dir=`dirname $$dest_file`; \
+	     src_file=$(2)"/"`echo $$rel_file`; \
+	     echo " INSTALL   "$(3)"/"`echo $$rel_file`; \
+	     mkdir -p $$dest_dir; \
+	     cp -f $$src_file $$dest_file; \
+	     done \
+	     fi
+inst_dir =  $(CMD_PREFIX)mkdir -p $(1); \
+	     echo " INSTALL   $(subst $(install_root_dir)/,,$(1))"; \
+	     rm -rf $(1); \
+	     cp -rf $(2) $(1)
+compile_cpp = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " CPP       $(subst $(build_dir)/,,$(1))"; \
+	     $(CPP) $(CPPFLAGS) -x c $(2) | grep -v "\#" > $(1)
+compile_cc_dep = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " CC-DEP    $(subst $(build_dir)/,,$(1))"; \
+	     printf %s `dirname $(1)`/  > $(1) && \
+	     $(CC) $(CFLAGS) $(call dynamic_flags,$(1),$(2))   \
+	       -MM $(2) >> $(1) || rm -f $(1)
+compile_cc = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " CC        $(subst $(build_dir)/,,$(1))"; \
+	     $(CC) $(CFLAGS) $(call dynamic_flags,$(1),$(2)) -c $(2) -o $(1)
+compile_elf = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " ELF       $(subst $(build_dir)/,,$(1))"; \
+	     $(CC) $(CFLAGS) $(2) $(3) $(4) $(ELFFLAGS) -o $(1)
+compile_ar = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " AR        $(subst $(build_dir)/,,$(1))"; \
+	     $(AR) $(ARFLAGS) $(1) $(2)
+compile_so = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " SO        $(subst $(build_dir)/,,$(1))"; \
+	     $(CC) -shared \
+	       $(LDFLAGS) $(EXTRA_LDFLAGS) -o $(1) $(2)
+gen_pkgconfig = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
+	     echo " GEN       $(subst $(build_dir)/,,$(1))"; \
+	     printf '%s\n' \
+	       'prefix=/usr' \
+	       'libdir=$${prefix}$(LIBRPMI_PKGCONFIG_LIBDIR)' \
+	       'includedir=$${prefix}/include' \
+	       '' \
+	       'Name: librpmi' \
+	       'Description: RISC-V Platform Management Interface (RPMI) protocol helper library' \
+	       'Version: $(LIBRPMI_VERSION)' \
+	       'Libs: -L$${libdir} -lrpmi' \
+	       'Cflags: -I$${includedir}' > $(1)
+
+blobs-y = $(build_dir)/librpmi.a
+blobs-y += $(build_dir)/librpmi.so.$(LIBRPMI_VERSION)
+blobs-y += $(build_dir)/librpmi.pc
+blobs-$(LIBRPMI_TEST) += $(test-elfs-path-y)
+
+# Default rule "make" should always be first rule
+.PHONY: all
+all: printdetails $(blobs-y)
+
+.PHONY: printdetails
+printdetails:
+	$(info )
+	$(info ------------------ LIBRPMI BUILD INFO --------------------)
+	$(info CC:        ($(CC)))
+	$(info CPP:       ($(CPP)))
+	$(info AS:        ($(AS)))
+	$(info AR:        ($(AR)))
+	$(info LD:        ($(LD)))
+	$(info ARFLAGS:   ($(ARFLAGS)))
+	$(info CFLAGS:    ($(CFLAGS)))
+	$(info LDFLAGS:   ($(LDFLAGS)))
+	$(info --------------------------------------------------)
+
+# Preserve all intermediate files
+.SECONDARY:
+
+$(build_dir)/%.elf: $(build_dir)/%.o $(test-objs-path-y) $(build_dir)/librpmi.a
+	$(call compile_elf,$@,$<,$(foreach obj,$($(*F)-objs-y),$(build_dir)/$(obj)),$($(*F)-cflags-y))
+
+$(build_dir)/librpmi.a: $(lib-objs-path-y)
+	$(call compile_ar,$@,$^)
+
+$(build_dir)/librpmi.so.$(LIBRPMI_VERSION): $(lib-objs-path-y)
+	$(call compile_so,$@,$^)
+	$(CMD_PREFIX)ln -sf librpmi.so.$(LIBRPMI_VERSION) $(build_dir)/librpmi.so.$(LIBRPMI_SOVERSION)
+	$(CMD_PREFIX)ln -sf librpmi.so.$(LIBRPMI_SOVERSION) $(build_dir)/librpmi.so
+
+$(build_dir)/librpmi.pc: Makefile
+	$(call gen_pkgconfig,$@)
+
+$(build_dir)/%.dep: $(src_dir)/%.c
+	$(call compile_cc_dep,$@,$<)
+
+$(build_dir)/%.o: $(src_dir)/%.c
+	$(call compile_cc,$@,$<)
+
+# Dependency files should only be included after default Makefile rules
+# They should not be included for any "xxxconfig" or "xxxclean" rule
+all-deps-1 = $(if $(findstring config,$(MAKECMDGOALS)),,$(deps-y))
+all-deps-2 = $(if $(findstring clean,$(MAKECMDGOALS)),,$(all-deps-1))
+-include $(all-deps-2)
+
+# Rule for "make install"
+.PHONY: install
+install: $(blobs-y) $(src_dir)/COPYING.BSD
+	$(call inst_dir,$(install_root_dir)/include,$(include_dir))
+	$(call inst_file,$(install_lib_dir)/librpmi.a,$(build_dir)/librpmi.a)
+	$(call inst_file,$(install_lib_dir)/librpmi.so.$(LIBRPMI_VERSION),$(build_dir)/librpmi.so.$(LIBRPMI_VERSION))
+	$(CMD_PREFIX)rm -f $(install_lib_dir)/librpmi.so.$(LIBRPMI_SOVERSION)
+	$(CMD_PREFIX)ln -sf librpmi.so.$(LIBRPMI_VERSION) $(install_lib_dir)/librpmi.so.$(LIBRPMI_SOVERSION)
+	$(CMD_PREFIX)rm -f $(install_lib_dir)/librpmi.so
+	$(CMD_PREFIX)ln -sf librpmi.so.$(LIBRPMI_SOVERSION) $(install_lib_dir)/librpmi.so
+	$(call inst_file,$(pkgconfig_dir)/librpmi.pc,$(build_dir)/librpmi.pc)
+	$(call inst_file,$(install_root_dir)/COPYING.BSD,$(src_dir)/COPYING.BSD)
+
+# Rule for "make clean"
+.PHONY: clean
+clean:
+	$(CMD_PREFIX)mkdir -p $(build_dir)
+	$(if $(V), @echo " RM        $(build_dir)/*.o")
+	$(CMD_PREFIX)find $(build_dir) -type f -name "*.o" -exec rm -rf {} +
+	$(if $(V), @echo " RM        $(build_dir)/*.a")
+	$(CMD_PREFIX)find $(build_dir) -type f -name "*.a" -exec rm -rf {} +
+	$(if $(V), @echo " RM        $(build_dir)/*.so*")
+	$(CMD_PREFIX)find $(build_dir) -type f -name "*.so*" -exec rm -rf {} +
+	$(CMD_PREFIX)find $(build_dir) -type l -name "*.so*" -exec rm -rf {} +
+	$(CMD_PREFIX)find $(build_dir) -type f -name "*.pc" -exec rm -rf {} +
+	$(if $(V), @echo " RM        $(build_dir)/*.o")
+	$(CMD_PREFIX)find $(build_dir) -type f -name "*.elf" -exec rm -rf {} +
+
+# Rule for "make distclean"
+.PHONY: distclean
+distclean: clean
+	$(CMD_PREFIX)mkdir -p $(build_dir)
+	$(if $(V), @echo " RM        $(build_dir)/*.dep")
+	$(CMD_PREFIX)find $(build_dir) -type f -name "*.dep" -exec rm -rf {} +
+ifeq ($(build_dir),$(CURDIR)/build)
+	$(if $(V), @echo " RM        $(build_dir)")
+	$(CMD_PREFIX)rm -rf $(build_dir)
+endif
+ifeq ($(install_root_dir),$(install_root_dir_default))
+	$(if $(V), @echo " RM        $(install_root_dir_default)")
+	$(CMD_PREFIX)rm -rf $(install_root_dir_default)
+endif
+
+.PHONY: docs
+docs:
+	$(CMD_PREFIX)mkdir -p $(docs_dir)
+	$(CMD_PREFIX)cat docs/doxygen/Doxyfile | sed -e "s#@@SRC_DIR@@#.#" -e "s#@@BUILD_DIR@@#$(build_dir)#" > $(docs_dir)/Doxyfile
+	$(CMD_PREFIX)doxygen $(docs_dir)/Doxyfile
+	$(CMD_PREFIX)make -C $(docs_dir)/latex
+
+# Rule for make cleandocs
+.PHONY: cleandocs
+cleandocs:
+	$(CMD_PREFIX)rm -rf $(build_dir)/docs
+
+.PHONY: check
+check: all
+	$(CMD_PREFIX)NFAIL=0; \
+	for test_elf in $(test-elfs-path-y); do \
+		if [ -f "$$test_elf" ]; then \
+			echo "--------------------------------------------------"; \
+			$$test_elf; \
+			RESULT=$$?; \
+			if [ $$RESULT -ne 0 ]; then \
+				NFAIL=$$((NFAIL + 1)); \
+			fi; \
+		fi; \
+	done; \
+	if [ $$NFAIL -ne 0 ]; then \
+	  exit 1; \
+	fi
+
+.PHONY: FORCE
+FORCE:
+
+# Rule for "make rpm-pkg"
+.PHONY: rpm-pkg
+rpm-pkg:
+	$(CMD_PREFIX)command -v rpmbuild >/dev/null 2>&1 || { echo "ERROR: rpmbuild not found"; exit 1; }
+	$(CMD_PREFIX)mkdir -p $(rpm_sourcedir) $(rpm_topdir)/SPECS $(rpm_topdir)/SOURCES \
+		$(rpm_topdir)/BUILD $(rpm_topdir)/BUILDROOT $(rpm_topdir)/RPMS $(rpm_topdir)/SRPMS
+	$(CMD_PREFIX)git -C $(src_dir) archive --format=tar.gz \
+		--prefix=librpmi-$(LIBRPMI_VERSION)/ HEAD > $(rpm_source_tarball)
+	$(CMD_PREFIX)cp -f $(rpm_source_tarball) $(rpm_topdir)/SOURCES/
+	$(CMD_PREFIX)cp -f $(rpm_spec) $(rpm_topdir)/SPECS/
+	$(CMD_PREFIX)rpm_nodeps_opt=""; \
+	if [ "$(RPMBUILD_NODEPS)" = "1" ]; then rpm_nodeps_opt="--nodeps"; fi; \
+	rpmbuild $(RPMBUILD_MODE) $(rpm_topdir)/SPECS/librpmi.spec $$rpm_nodeps_opt \
+		--define "_topdir $(rpm_topdir)" \
+		--define "version $(LIBRPMI_VERSION)" \
+		--define "soversion $(LIBRPMI_SOVERSION)"
+
+# Rule for "make deb-pkg"
+.PHONY: deb-pkg
+deb-pkg:
+	$(CMD_PREFIX)command -v dpkg-buildpackage >/dev/null 2>&1 || { echo "ERROR: dpkg-buildpackage not found"; exit 1; }
+	$(CMD_PREFIX)test -f $(deb_pkg_dir)/control || { echo "ERROR: Debian packaging not found at $(deb_pkg_dir)"; exit 1; }
+	$(CMD_PREFIX)rm -rf $(deb_staging_dir)
+	$(CMD_PREFIX)mkdir -p $(deb_staging_dir)
+	$(CMD_PREFIX)tar -C $(src_dir) \
+		--exclude='./.git' \
+		--exclude='$(deb_exclude_build)' \
+		--exclude='$(deb_exclude_install)' \
+		--exclude='./debian' \
+		-cf - . | tar -C $(deb_staging_dir) -xf -
+	$(CMD_PREFIX)rm -rf $(deb_staging_dir)/debian
+	$(CMD_PREFIX)cp -a $(deb_pkg_dir) $(deb_staging_dir)/debian
+	$(CMD_PREFIX)chmod +x $(deb_staging_dir)/debian/rules
+	$(CMD_PREFIX)cd $(deb_staging_dir) && dpkg-buildpackage $(DEB_BUILD_ARGS)
+	$(CMD_PREFIX)echo "DEB packages are under $(deb_output_dir)"
