@@ -1188,16 +1188,264 @@ static void create_fdt_sbi_mpxy_performance(RISCVVirtState *s, uint32_t *phandle
     }
 }
 
-static void create_fdt_sbi_mpxy_voltage(RISCVVirtState *s,
+/*
+ * Which consumer each emulated voltage domain is handed to. Each group needs
+ * rails of its own: rpmi-voltage-test moves every voltage it is given, the
+ * device tree range consumers each move volt6 across its whole range, and the
+ * OPP consumers only show arbitration if no other consumer's request takes
+ * part in it.
+ */
+#define VIRT_RPMI_VOLT_FREE_COUNT       6   /* volt0..volt5 */
+#define VIRT_RPMI_VOLT_RANGED           6   /* volt6 */
+#define VIRT_RPMI_VOLT_SHARED           7   /* volt7 */
+
+/*
+ * The range the board permits volt6. volt6 advertises 1.0, 1.8 and 2.5 V and
+ * powers up at 1.0 V, so the range leaves out the level it starts at: the
+ * supervisor has to bring the rail into range when it registers it, with no
+ * consumer asking.
+ */
+#define VIRT_RPMI_VOLT_RANGED_MIN_UV    1800000
+#define VIRT_RPMI_VOLT_RANGED_MAX_UV    2500000
+
+/*
+ * The consumers of volt6, and the range each one's node says it needs, as
+ * "voltage-range-microvolt = <min max>". This follows the MMC bindings'
+ * "voltage-ranges", where a host's own node states the voltages its slot
+ * needs and the driver asks the supply for them. They probe in this order:
+ *
+ *   a  needs exactly 2.5 V, and gets it.
+ *   b  needs 1.8..2.7 V; the rail's range cuts that to 1.8..2.5 V, and with
+ *      a holding 2.5 V it settles there.
+ *   c  needs 1.7..1.95 V, which cannot overlap a's 2.5 V, so it is refused.
+ *   d  needs 1.0..1.2 V, below the rail's range altogether, so it is refused.
+ */
+static const struct {
+    const char *suffix;
+    uint32_t min_uv;
+    uint32_t max_uv;
+} virt_rpmi_volt_dt_consumers[] = {
+    { "a", 2500000, 2500000 },
+    { "b", 1800000, 2700000 },
+    { "c", 1700000, 1950000 },
+    { "d", 1000000, 1200000 },
+};
+
+/*
+ * The range the board permits the shared rail, as a regulator constraint on
+ * its node. volt7 advertises 1.0, 1.2, 1.5, 1.8 and 2.5 V, so this cuts a
+ * level off each end: a request can then be narrowed or refused by the
+ * provider, not only by the other consumers.
+ */
+#define VIRT_RPMI_VOLT_SHARED_MIN_UV    1200000
+#define VIRT_RPMI_VOLT_SHARED_MAX_UV    1800000
+
+/*
+ * One consumer of the shared rail, and the voltage range its OPP table asks
+ * for as <target min max>. They probe in this order, and each is chosen to
+ * show one way the regulator core handles a request:
+ *
+ *   a  reaches below the provider's range, so the core narrows it to the
+ *      part inside, and the rail goes to 1.2 V rather than the 1.0 V asked.
+ *   b  wants 1.8 V, which a cannot live with, so the core falls back to b's
+ *      min..max and settles on the one level both accept, 1.5 V.
+ *   c  asks only for 2.5 V, outside the provider's range altogether. The OPP
+ *      core checks each entry against the regulator when it parses the table
+ *      and drops this one, so the request never reaches the rail at all.
+ *   d  asks only for 1.2 V, which the provider allows but b does not, so the
+ *      other consumers refuse it.
+ *
+ * Neither the drop nor the refusal moves the rail.
+ */
+static const struct {
+    const char *suffix;
+    uint32_t target_uv;
+    uint32_t min_uv;
+    uint32_t max_uv;
+} virt_rpmi_volt_opp_consumers[] = {
+    { "a", 1000000, 1000000, 1500000 },
+    { "b", 1800000, 1500000, 1800000 },
+    { "c", 2500000, 2500000, 2500000 },
+    { "d", 1200000, 1200000, 1200000 },
+};
+
+static void create_fdt_sbi_mpxy_voltage_opp_test(RISCVVirtState *s,
+                                                 uint32_t *phandle,
+                                                 const char *supply_name,
+                                                 uint32_t supply_phandle)
+{
+    MachineState *mc = MACHINE(s);
+    int i;
+
+    /*
+     * libfdt adds a node ahead of its existing siblings, and Linux probes
+     * them in device tree order. Create the consumers last to first so they
+     * probe first to last, which is the order the arbitration above assumes.
+     */
+    for (i = ARRAY_SIZE(virt_rpmi_volt_opp_consumers) - 1; i >= 0; i--) {
+        uint32_t table_phandle = (*phandle)++;
+        g_autofree char *table = NULL;
+        g_autofree char *opp = NULL;
+        g_autofree char *test = NULL;
+        g_autofree char *prop = NULL;
+
+        table = g_strdup_printf("/opp-table-rpmi-voltage-%s",
+                                virt_rpmi_volt_opp_consumers[i].suffix);
+        qemu_fdt_add_subnode(mc->fdt, table);
+        qemu_fdt_setprop_string(mc->fdt, table, "compatible",
+                                "operating-points-v2");
+        qemu_fdt_setprop_cell(mc->fdt, table, "phandle", table_phandle);
+
+        opp = g_strdup_printf("%s/opp-1", table);
+        qemu_fdt_add_subnode(mc->fdt, opp);
+        qemu_fdt_setprop_cell(mc->fdt, opp, "opp-level", 1);
+        qemu_fdt_setprop_cells(mc->fdt, opp, "opp-microvolt",
+                               virt_rpmi_volt_opp_consumers[i].target_uv,
+                               virt_rpmi_volt_opp_consumers[i].min_uv,
+                               virt_rpmi_volt_opp_consumers[i].max_uv);
+
+        test = g_strdup_printf("/soc/rpmi-voltage-opp-test-%s",
+                               virt_rpmi_volt_opp_consumers[i].suffix);
+        qemu_fdt_add_subnode(mc->fdt, test);
+        qemu_fdt_setprop_string(mc->fdt, test, "compatible",
+                                "riscv,rpmi-voltage-opp-test");
+        prop = g_strdup_printf("%s-supply", supply_name);
+        qemu_fdt_setprop_cell(mc->fdt, test, prop, supply_phandle);
+        qemu_fdt_setprop_cell(mc->fdt, test, "operating-points-v2",
+                              table_phandle);
+    }
+}
+
+/*
+ * The voltage service group, described the way SCMI describes its voltage
+ * domains.
+ *
+ * A domain is discovered over RPMI, so nothing here describes what it can
+ * do. It still needs a node of its own, because that is the only thing a
+ * consumer's "<name>-supply" can point at: the property is a bare phandle,
+ * with no room for a domain index. So every domain gets a child in the
+ * "regulators" container, "regulator@<id>" with "reg" set to its RPMI
+ * DOMAIN_ID, the way SCMI ties its voltage domains to their nodes.
+ *
+ * What a board permits a rail to supply is the one voltage fact RPMI cannot
+ * report, and a regulator constraint on that child is where it goes. Two
+ * domains have one, both ranges. volt6's excludes the level it powers up at,
+ * so the supervisor moves the rail into it when the regulator is registered,
+ * and refuses any consumer that asks to leave it. volt7's is the range inside
+ * which its consumers' requests are arbitrated.
+ */
+static void create_fdt_sbi_mpxy_voltage(RISCVVirtState *s, uint32_t *phandle,
                                         uint32_t mpxy_mbox_phandle)
 {
     MachineState *mc = MACHINE(s);
+    g_autofree uint32_t *supplies = NULL;
+    char *test;
+    uint32_t count, i;
 
     qemu_fdt_add_subnode(mc->fdt, "/soc/rpmi-voltage");
     qemu_fdt_setprop_string(mc->fdt, "/soc/rpmi-voltage", "compatible",
                             "riscv,rpmi-voltage");
     qemu_fdt_setprop_cells(mc->fdt, "/soc/rpmi-voltage", "mboxes",
                            mpxy_mbox_phandle, 0x1004, 0x0);
+
+    count = riscv_rpmi_voltage_domain_count();
+    if (count <= VIRT_RPMI_VOLT_SHARED) {
+        return;
+    }
+
+    qemu_fdt_add_subnode(mc->fdt, "/soc/rpmi-voltage/regulators");
+    qemu_fdt_setprop_cell(mc->fdt, "/soc/rpmi-voltage/regulators",
+                          "#address-cells", 1);
+    qemu_fdt_setprop_cell(mc->fdt, "/soc/rpmi-voltage/regulators",
+                          "#size-cells", 0);
+
+    /*
+     * Last to first, so that the children read regulator@0 first in the
+     * device tree, for the reason given in
+     * create_fdt_sbi_mpxy_voltage_opp_test().
+     */
+    supplies = g_new0(uint32_t, count);
+    for (i = count; i-- > 0;) {
+        RISCVRPMIVoltageDomainName info;
+        g_autofree char *child = NULL;
+
+        if (!riscv_rpmi_voltage_domain_name(i, &info)) {
+            continue;
+        }
+
+        supplies[i] = (*phandle)++;
+
+        child = g_strdup_printf("/soc/rpmi-voltage/regulators/regulator@%x", i);
+        qemu_fdt_add_subnode(mc->fdt, child);
+        qemu_fdt_setprop_cell(mc->fdt, child, "reg", i);
+        if (i == VIRT_RPMI_VOLT_RANGED) {
+            qemu_fdt_setprop_cell(mc->fdt, child, "regulator-min-microvolt",
+                                  VIRT_RPMI_VOLT_RANGED_MIN_UV);
+            qemu_fdt_setprop_cell(mc->fdt, child, "regulator-max-microvolt",
+                                  VIRT_RPMI_VOLT_RANGED_MAX_UV);
+        } else if (i == VIRT_RPMI_VOLT_SHARED) {
+            qemu_fdt_setprop_cell(mc->fdt, child, "regulator-min-microvolt",
+                                  VIRT_RPMI_VOLT_SHARED_MIN_UV);
+            qemu_fdt_setprop_cell(mc->fdt, child, "regulator-max-microvolt",
+                                  VIRT_RPMI_VOLT_SHARED_MAX_UV);
+        }
+        qemu_fdt_setprop_cell(mc->fdt, child, "phandle", supplies[i]);
+    }
+
+    /* A driver that picks voltages for itself, through the consumer API. */
+    test = g_strdup_printf("/soc/rpmi-voltage-test");
+    qemu_fdt_add_subnode(mc->fdt, test);
+    qemu_fdt_setprop_string(mc->fdt, test, "compatible",
+                            "riscv,rpmi-voltage-test");
+    for (i = VIRT_RPMI_VOLT_FREE_COUNT; i-- > 0;) {
+        RISCVRPMIVoltageDomainName info;
+        g_autofree char *prop = NULL;
+
+        if (!supplies[i] || !riscv_rpmi_voltage_domain_name(i, &info)) {
+            continue;
+        }
+        prop = g_strdup_printf("%s-supply", info.name);
+        qemu_fdt_setprop_cell(mc->fdt, test, prop, supplies[i]);
+    }
+    g_free(test);
+
+    /*
+     * Consumers of a rail whose range the device tree sets, each stating in
+     * its own node the range it needs. Last to first, so they probe first to
+     * last.
+     */
+    if (supplies[VIRT_RPMI_VOLT_RANGED]) {
+        RISCVRPMIVoltageDomainName info;
+        g_autofree char *prop = NULL;
+        int j;
+
+        riscv_rpmi_voltage_domain_name(VIRT_RPMI_VOLT_RANGED, &info);
+        prop = g_strdup_printf("%s-supply", info.name);
+        for (j = ARRAY_SIZE(virt_rpmi_volt_dt_consumers) - 1; j >= 0; j--) {
+            test = g_strdup_printf("/soc/rpmi-voltage-dt-test-%s",
+                                   virt_rpmi_volt_dt_consumers[j].suffix);
+            qemu_fdt_add_subnode(mc->fdt, test);
+            qemu_fdt_setprop_string(mc->fdt, test, "compatible",
+                                    "riscv,rpmi-voltage-dt-test");
+            qemu_fdt_setprop_cells(mc->fdt, test, "voltage-range-microvolt",
+                                   virt_rpmi_volt_dt_consumers[j].min_uv,
+                                   virt_rpmi_volt_dt_consumers[j].max_uv);
+            qemu_fdt_setprop_cell(mc->fdt, test, prop,
+                                  supplies[VIRT_RPMI_VOLT_RANGED]);
+            g_free(test);
+        }
+    }
+
+    /*
+     * Consumers that ask for a voltage from the device tree, through the one
+     * standard way to do so: an OPP table. All of them share a rail, so the
+     * regulator core has to arbitrate between their requests. Each names
+     * the rail "vdd", as a device describing its own supply input would.
+     */
+    if (supplies[VIRT_RPMI_VOLT_SHARED]) {
+        create_fdt_sbi_mpxy_voltage_opp_test(s, phandle, "vdd",
+                                             supplies[VIRT_RPMI_VOLT_SHARED]);
+    }
 }
 
 static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
@@ -1222,7 +1470,7 @@ static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
     create_fdt_sbi_mpxy_device_power(s, phandle, mpxy_mbox_phandle,
                                      dpwr_phandle);
     create_fdt_sbi_mpxy_performance(s, phandle, mpxy_mbox_phandle, perf_phandle);
-    create_fdt_sbi_mpxy_voltage(s, mpxy_mbox_phandle);
+    create_fdt_sbi_mpxy_voltage(s, phandle, mpxy_mbox_phandle);
 }
 
 /*

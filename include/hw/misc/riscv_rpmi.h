@@ -108,4 +108,19 @@ typedef struct riscv_rpmi_perf_domain_info RISCVRPMIPerfDomainInfo;
 uint32_t riscv_rpmi_perf_domain_count(void);
 bool riscv_rpmi_perf_domain_info(uint32_t id, RISCVRPMIPerfDomainInfo *info);
 
+/*
+ * The name a voltage domain reports over RPMI. The device tree builder needs
+ * it to name the "regulators" child that constrains that domain, because the
+ * supervisor matches the two by name.
+ */
+struct riscv_rpmi_voltage_domain_name {
+    const char *name;
+};
+
+typedef struct riscv_rpmi_voltage_domain_name RISCVRPMIVoltageDomainName;
+
+uint32_t riscv_rpmi_voltage_domain_count(void);
+bool riscv_rpmi_voltage_domain_name(uint32_t id,
+                                    RISCVRPMIVoltageDomainName *info);
+
 #endif

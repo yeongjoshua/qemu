@@ -2,6 +2,7 @@
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "librpmi.h"
+#include "hw/misc/riscv_rpmi.h"
 
 #define NUM_LEVELS_DISCRETE(a, d)       (sizeof(a) / sizeof(d))
 
@@ -419,6 +420,22 @@ const struct rpmi_voltage_platform_ops voltage_ops = {
     .set_level  = volt_set_level,
     .get_supp_levels = volt_get_supp_levels,
 };
+
+uint32_t riscv_rpmi_voltage_domain_count(void)
+{
+    return RPMI_VOLTAGE_DOMAIN_COUNT;
+}
+
+bool riscv_rpmi_voltage_domain_name(uint32_t id, RISCVRPMIVoltageDomainName *info)
+{
+    if (id >= RPMI_VOLTAGE_DOMAIN_COUNT || !info) {
+        return false;
+    }
+
+    info->name = voltage_data[id].name;
+
+    return true;
+}
 
 int add_voltage_group(struct rpmi_context *vctx)
 {
