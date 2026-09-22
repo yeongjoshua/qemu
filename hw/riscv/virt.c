@@ -1050,6 +1050,24 @@ static void create_fdt_rpmi_mbox(RISCVVirtState *s,
     g_free(name);
 }
 
+static void create_fdt_rpmi_device_power(RISCVVirtState *s, uint64_t shmem_base,
+                                         uint32_t rpmi_mbox_handle)
+{
+    char *name;
+    uint32_t device_power_servicegrp = 9;
+    MachineState *mc = MACHINE(s);
+
+    name = g_strdup_printf("/soc/mailbox@%" HWADDR_PRIx "/device_power@%x",
+                           shmem_base, device_power_servicegrp);
+    qemu_fdt_add_subnode(mc->fdt, name);
+    qemu_fdt_setprop_string(mc->fdt, name, "compatible",
+                            "riscv,rpmi-mpxy-device-power");
+    qemu_fdt_setprop_cells(mc->fdt, name, "mboxes",
+                           rpmi_mbox_handle, device_power_servicegrp);
+    qemu_fdt_setprop_cell(mc->fdt,  name, "riscv,sbi-mpxy-channel-id", 0x1002);
+    g_free(name);
+}
+
 static void create_fdt_sbi_mbox(RISCVVirtState *s, uint32_t *phandle,
                                 uint32_t msi_phandle, uint32_t *mpxy_mbox_phandle)
 {
@@ -1069,6 +1087,22 @@ static void create_fdt_sbi_mbox(RISCVVirtState *s, uint32_t *phandle,
     g_free(name);
 }
 
+static void create_fdt_sbi_mpxy_device_power(RISCVVirtState *s, uint32_t *phandle,
+                                             uint32_t mpxy_mbox_phandle)
+{
+    char *name;
+    MachineState *mc = MACHINE(s);
+    uint32_t dpwr_phandle = (*phandle)++;
+
+    name = g_strdup_printf("/soc/rpmi-device-power");
+    qemu_fdt_add_subnode(mc->fdt, name);
+    qemu_fdt_setprop_string(mc->fdt, name, "compatible", "riscv,rpmi-device-power");
+    qemu_fdt_setprop_cell(mc->fdt, name, "phandle", dpwr_phandle);
+    qemu_fdt_setprop_cell(mc->fdt, name, "#power-domain-cells", 1);
+    qemu_fdt_setprop_cells(mc->fdt, name, "mboxes", mpxy_mbox_phandle, 0x1002, 0x0);
+    g_free(name);
+}
+
 static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
                                   uint64_t db_base, uint32_t msi_phandle,
                                   uint32_t *phandle, uint32_t a2preq_qsz,
@@ -1079,8 +1113,12 @@ static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
     create_fdt_rpmi_mbox(s, shmem_base, db_base, phandle, &rpmi_mbox_handle,
                          a2preq_qsz, p2areq_qsz, dbsz);
 
+    /* MPXY channel nodes under the mailbox, consumed by OpenSBI */
+    create_fdt_rpmi_device_power(s, shmem_base, rpmi_mbox_handle);
+
     /* Client nodes hanging off the SBI MPXY mailbox, consumed by the OS */
     create_fdt_sbi_mbox(s, phandle, msi_phandle, &mpxy_mbox_phandle);
+    create_fdt_sbi_mpxy_device_power(s, phandle, mpxy_mbox_phandle);
 }
 
 static void finalize_fdt(RISCVVirtState *s)
