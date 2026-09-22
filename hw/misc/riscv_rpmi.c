@@ -42,6 +42,7 @@ int init_rpmi_svc_groups(hwaddr shm_addr, int shm_sz,
                          uint32_t soc_xport_type);
 int add_device_power_group(struct rpmi_context *rctx);
 int add_performance_group(struct rpmi_context *pctx);
+int add_voltage_group(struct rpmi_context *pctx);
 struct rpmi_shmem *rpmi_shmem_qemu_create(const char *name, rpmi_uint64_t base,
                                             rpmi_uint32_t size);
 
@@ -217,6 +218,9 @@ int init_rpmi_svc_groups(hwaddr shm_addr, int shm_sz,
 
         /* create rpmi performance service group */
         add_performance_group(rctx);
+
+        /* create rpmi voltage service group */
+        add_voltage_group(rctx);
     }
 
     /* save the context */
