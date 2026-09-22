@@ -108,6 +108,8 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_FW_CFG] =       { 0x10100000,          0x18 },
     [VIRT_RPMI_SHMEM] =   { 0x10240000,        0xf000 },
     [VIRT_RPMI_DOORBELL] = { 0x1024f000,       0x1000 },
+    [VIRT_RPMI_PERF_SHMEM] = { 0x10300000,    0x10000 },
+    [VIRT_RPMI_PERF_DOORBELL] = { 0x10310000,  0x1000 },
     [VIRT_FLASH] =        { 0x20000000,     0x4000000 },
     [VIRT_IMSIC_M] =      { 0x24000000, VIRT_IMSIC_MAX_SIZE },
     [VIRT_IMSIC_S] =      { 0x28000000, VIRT_IMSIC_MAX_SIZE },
@@ -1068,6 +1070,24 @@ static void create_fdt_rpmi_device_power(RISCVVirtState *s, uint64_t shmem_base,
     g_free(name);
 }
 
+static void create_fdt_rpmi_performance(RISCVVirtState *s, uint64_t shmem_base,
+                                        uint32_t rpmi_mbox_handle)
+{
+    char *name;
+    uint32_t performance_servicegrp = 10;
+    MachineState *mc = MACHINE(s);
+
+    name = g_strdup_printf("/soc/mailbox@%" HWADDR_PRIx "/performance@%x",
+                           shmem_base, performance_servicegrp);
+    qemu_fdt_add_subnode(mc->fdt, name);
+    qemu_fdt_setprop_string(mc->fdt, name, "compatible",
+                            "riscv,rpmi-mpxy-performance");
+    qemu_fdt_setprop_cells(mc->fdt, name, "mboxes",
+            rpmi_mbox_handle, performance_servicegrp);
+    qemu_fdt_setprop_cell(mc->fdt,  name, "riscv,sbi-mpxy-channel-id", 0x1003);
+    g_free(name);
+}
+
 static void create_fdt_sbi_mbox(RISCVVirtState *s, uint32_t *phandle,
                                 uint32_t msi_phandle, uint32_t *mpxy_mbox_phandle)
 {
@@ -1103,10 +1123,55 @@ static void create_fdt_sbi_mpxy_device_power(RISCVVirtState *s, uint32_t *phandl
     g_free(name);
 }
 
+static void create_fdt_sbi_mpxy_performance(RISCVVirtState *s, uint32_t *phandle,
+                                            uint32_t mpxy_mbox_phandle,
+                                            uint32_t *perf_phandle)
+{
+    char *name, *test;
+    MachineState *mc = MACHINE(s);
+    uint32_t performance_phandle = (*phandle)++;
+    RISCVRPMIPerfDomainInfo info;
+    uint32_t count;
+
+    *perf_phandle = performance_phandle;
+
+    name = g_strdup_printf("/soc/rpmi-performance");
+    qemu_fdt_add_subnode(mc->fdt, name);
+    qemu_fdt_setprop_string(mc->fdt, name, "compatible", "riscv,rpmi-performance");
+    qemu_fdt_setprop_cell(mc->fdt, name, "phandle", performance_phandle);
+    qemu_fdt_setprop_cell(mc->fdt, name, "#performance-domain-cells", 1);
+    qemu_fdt_setprop_cell(mc->fdt, name, "#power-domain-cells", 1);
+    qemu_fdt_setprop_cells(mc->fdt, name, "mboxes", mpxy_mbox_phandle, 0x1003, 0x0);
+    g_free(name);
+
+    /*
+     * A consumer node so that a guest driver can drive a performance domain
+     * that is not a CPU domain. A CPU names its domain through
+     * "performance-domains", but any other device names it through
+     * "power-domains", as a power domain whose performance states are the
+     * domain's levels. It takes the last domain the platform
+     * microcontroller advertises, which exists for this purpose, rather than
+     * a hardcoded index, so that adding a domain later does not silently
+     * repoint the node. Like /soc/rpmi-voltage-test this is a device tree
+     * consumer only, not an emulated device.
+     */
+    count = riscv_rpmi_perf_domain_count();
+    if (count && riscv_rpmi_perf_domain_info(count - 1, &info)) {
+        test = g_strdup_printf("/soc/rpmi-performance-test");
+        qemu_fdt_add_subnode(mc->fdt, test);
+        qemu_fdt_setprop_string(mc->fdt, test, "compatible",
+                                "riscv,rpmi-performance-test");
+        qemu_fdt_setprop_cells(mc->fdt, test, "power-domains",
+                               performance_phandle, count - 1);
+        g_free(test);
+    }
+}
+
 static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
                                   uint64_t db_base, uint32_t msi_phandle,
                                   uint32_t *phandle, uint32_t a2preq_qsz,
-                                  uint32_t p2areq_qsz, uint32_t dbsz)
+                                  uint32_t p2areq_qsz, uint32_t dbsz,
+                                  uint32_t *perf_phandle)
 {
     uint32_t rpmi_mbox_handle = 1, mpxy_mbox_phandle = 1;
 
@@ -1115,10 +1180,81 @@ static void create_fdt_rpmi_nodes(RISCVVirtState *s, uint64_t shmem_base,
 
     /* MPXY channel nodes under the mailbox, consumed by OpenSBI */
     create_fdt_rpmi_device_power(s, shmem_base, rpmi_mbox_handle);
+    create_fdt_rpmi_performance(s, shmem_base, rpmi_mbox_handle);
 
     /* Client nodes hanging off the SBI MPXY mailbox, consumed by the OS */
     create_fdt_sbi_mbox(s, phandle, msi_phandle, &mpxy_mbox_phandle);
     create_fdt_sbi_mpxy_device_power(s, phandle, mpxy_mbox_phandle);
+    create_fdt_sbi_mpxy_performance(s, phandle, mpxy_mbox_phandle, perf_phandle);
+}
+
+/*
+ * The RPMI performance domain of each CPU, by hart ID: harts 0 and 1 share
+ * perf0, and hart 2 has perf1 to itself. So one CPU gets one domain, two CPUs
+ * share one, and a third gets a domain of its own. Any further hart is left
+ * without a performance domain.
+ */
+static const uint32_t virt_rpmi_cpu_perf_domains[] = { 0, 0, 1 };
+
+/*
+ * Point the CPU nodes at their RPMI performance domains.
+ *
+ * The vendor tree set this from create_fdt_socket_cpus(), but that helper now
+ * lives in hw/riscv/fdt-common.c and is shared with the other RISC-V machines,
+ * so the property is added here instead. It is applied after the CPU nodes
+ * exist and uses the phandle actually allocated for /soc/rpmi-performance
+ * rather than a hardcoded one.
+ */
+static void virt_fdt_add_performance_domains(RISCVVirtState *s,
+                                             uint32_t perf_phandle)
+{
+    MachineState *ms = MACHINE(s);
+    int socket, cpu;
+
+    for (socket = 0; socket < riscv_socket_count(ms); socket++) {
+        int base_hartid = riscv_socket_first_hartid(ms, socket);
+        int hart_count = riscv_socket_hart_count(ms, socket);
+
+        if (base_hartid < 0 || hart_count < 0) {
+            continue;
+        }
+
+        for (cpu = 0; cpu < hart_count; cpu++) {
+            int hartid = base_hartid + cpu;
+            g_autofree char *cpu_name = NULL;
+
+            if (hartid >= ARRAY_SIZE(virt_rpmi_cpu_perf_domains)) {
+                continue;
+            }
+
+            cpu_name = g_strdup_printf("/cpus/cpu@%d", hartid);
+            qemu_fdt_setprop_cells(ms->fdt, cpu_name, "performance-domains",
+                                   perf_phandle,
+                                   virt_rpmi_cpu_perf_domains[hartid]);
+        }
+    }
+}
+
+/*
+ * Let only hart 0 cold boot.
+ *
+ * OpenSBI lets every hart race for the cold boot, and the winner is the hart
+ * the kernel starts on, so the guest's logical CPU numbering changes from one
+ * boot to the next. The "boot_hart" that fw_dynamic is handed only picks the
+ * hart that relocates the firmware, not the one that wins that race. The RPMI
+ * performance domains are assigned by hart ID, so pin the cold boot to hart 0
+ * through the OpenSBI configuration node, which OpenSBI removes from the tree
+ * before the kernel sees it.
+ */
+static void virt_fdt_add_cold_boot_hart(RISCVVirtState *s)
+{
+    MachineState *ms = MACHINE(s);
+    const char *name = "/chosen/opensbi-config";
+
+    qemu_fdt_add_subnode(ms->fdt, name);
+    qemu_fdt_setprop_string(ms->fdt, name, "compatible", "opensbi,config");
+    qemu_fdt_setprop_cell(ms->fdt, name, "cold-boot-harts",
+                          qemu_fdt_get_phandle(ms->fdt, "/cpus/cpu@0"));
 }
 
 static void finalize_fdt(RISCVVirtState *s)
@@ -1144,13 +1280,18 @@ static void finalize_fdt(RISCVVirtState *s)
 
     if (s->have_rpmi) {
         const MemMapEntry *memmap = s->memmap;
+        uint32_t perf_phandle = 0;
 
         create_fdt_rpmi_nodes(s, memmap[VIRT_RPMI_SHMEM].base,
                               memmap[VIRT_RPMI_DOORBELL].base,
                               msi_pcie_phandle, &phandle,
                               VIRT_RPMI_A2PREQ_QUEUE_SIZE,
                               VIRT_RPMI_P2AREQ_QUEUE_SIZE,
-                              memmap[VIRT_RPMI_DOORBELL].size);
+                              memmap[VIRT_RPMI_DOORBELL].size,
+                              &perf_phandle);
+
+        virt_fdt_add_performance_domains(s, perf_phandle);
+        virt_fdt_add_cold_boot_hart(s);
     }
 
     create_fdt_uart(s, irq_mmio_phandle);
@@ -1644,6 +1785,14 @@ static void virt_machine_init(MachineState *machine)
                           VIRT_RPMI_A2PREQ_QUEUE_SIZE,
                           VIRT_RPMI_P2AREQ_QUEUE_SIZE,
                           0, true, machine);
+
+        /*
+         * The performance fast channel is an independent MMIO device: a
+         * shared-memory window plus a doorbell that services level and
+         * limit requests without using the RPMI queues.
+         */
+        rpmi_perf_init(s->memmap[VIRT_RPMI_PERF_SHMEM].base,
+                       s->memmap[VIRT_RPMI_PERF_DOORBELL].base, NULL);
     }
 
     /* VirtIO MMIO devices */
